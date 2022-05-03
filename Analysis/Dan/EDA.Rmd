@@ -1,0 +1,759 @@
+---
+title: "EDA - Dan"
+author: "Dan Nolte"
+date: "4/28/2022"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: yes
+---
+
+## I. Data Prep
+```{r, message=F}
+# Seed
+set.seed(14)
+
+# Libraries
+library(tidyverse)
+library(pander)
+
+# Best subsets
+library(leaps)
+
+# Regularization
+library(glmnet)
+
+# GAM
+library(mgcv)
+
+# Cross Validation
+library(boot)
+library(caret)
+
+# Data Load
+load("../../Data/preg_aware_update0425_0427.RData")
+# load("/Users/dannolte/Documents/School/Spring 2022/BST 263/Project/bst263project/Data/preg_aware_update0425_0427.RData")
+data_raw = analysis2
+```
+
+### 1. Remove Unwanted Variables
+```{r}
+# 1. Remove variables with 1) all values missing, 2) most values missing, 3) all same values
+data = data_raw %>% 
+  select(!c(
+    age_last_perid, current_bf, ever_hormone_estrogen, ever_hormone_combo, 
+    duration_hormone_estrogen, duration_hormone_combo, ever_estrogen_patch,
+    duration_estrogen_patch, ever_combo_patch, duration_combo_patch, num_day_alcohol, 
+    test_preg, ever_preg, hysterectomy, rep_preg, preg, survey_season
+    )
+  )
+```
+
+### 2. Create factors
+```{r}
+# 2. Convert variables to factor
+non_factors = c("SEQN", "age", "number_ppl_household", "income_poverty_ratio", "age_menarche", "BMI", "parity")
+factors = setdiff(colnames(data), non_factors)
+data[factors] = lapply(data[factors], factor)
+```
+
+### 3. Level Reduction/Add Meaningful Labels where Applicable 
+```{r}
+# 3. Level Reduction on certain factors, add meaningful labels
+data = data %>% mutate(
+  education = factor(
+    case_when(
+      education %in% 1:2 ~ 1, 
+      education %in% 3:4 ~ 2, 
+      education == 5 ~ 3
+    ), 
+    levels = 1:3, 
+    labels = c(
+      "Less than HS degree",
+      "HS degree or some college",
+      "College degree or more"
+    )
+  ),
+  married = factor(
+    case_when(
+      married %in% c(1, 6) ~ 1, 
+      married %in% 3:4 ~ 2,
+      married == 5 ~ 3,
+    ), 
+    levels = 1:3, 
+    labels = c(
+      "Married/Cohab",
+      "Divorced/Separated",
+      "Never Married"
+    )
+  ),
+  smoker = factor(
+    case_when(
+      smoker == 0 ~ 1, 
+      smoker == 1 ~ 2,
+      smoker == 2 ~ 3,
+    ), 
+    levels = 1:3, 
+    labels = c(
+      "Never",
+      "Ever",
+      "Current"
+    )
+  ),
+  race = factor(
+    case_when(
+      race == 1 ~ 1, 
+      race == 2 ~ 2,
+      race == 3 ~ 3,
+      race == 4 ~ 4,
+      race == 5 ~ 5,
+    ), 
+    levels = 1:5, 
+    labels = c(
+      "Mexican American",
+      "Other Hispanic",
+      "Non-Hispanic White",
+      "Non-Hispanic Black",
+      "Other/Multi"
+    )
+  )
+)
+```
+
+### 4. Restrict to Complete Cases
+```{r}
+data_complete = na.omit(data)
+```
+
+## II. Summary Stats
+```{r}
+summary(data)
+```
+
+## III. Fit Models
+
+### Model 1: Logistic Regression - Include all variables
+```{r}
+# Part 1: All predictors
+mod1 = glm(aware ~ .-SEQN, data = data_complete, family = binomial)
+summary(mod1) %>% pander()
+```
+
+### Model 2: Logistic Regression - Include sensible variables 
+```{r}
+# Part 2: Subject matter best-guess predictors
+mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = data_complete, family = binomial())
+summary(mod2) %>% pander()
+```
+
+### Model 3: Logisic Regression - Use LASSO-selected variables
+```{r}
+# Part 3: Variable Selection
+
+# Best Subsets - Not advisable for logistic regression
+# Forward Selection - Not advisable for logistic regression
+# Backward Selection - Not advisable for logistic regression
+
+# LASSO
+grid = 10^seq(10,-2,length=100)
+x = data_complete %>% select(-aware, -SEQN)
+x = model.matrix(~ .-1, x)
+y = as.integer(data_complete$aware)
+
+lasso.mod=glmnet(x, y, alpha=1, lambda=grid)
+
+cv.out = cv.glmnet(x, y, family = "binomial", intercept = F, alpha = 1, nfolds = 10)
+best_lambda <- cv.out$lambda[which.min(cv.out$cvm)]
+
+lasso.coef = predict(lasso.mod, type = "coefficients", s = best_lambda)
+#lasso.coef
+
+# Fit model with LASSO-selected variables
+mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = data_complete, family = binomial())
+summary(mod3) %>% pander()
+```
+
+### Model 4: GAM - Use LASSO-selected variables
+```{r}
+# Part 4: GAM using lasso selection
+mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = data_complete, family = binomial)
+summary(mod4) 
+```
+
+## IV. Calculate Test Performance
+
+### 1. Folds = 10 | Cutoff = 0.5
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = 10
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+test_error_fold = matrix(0, K, n_models)
+sensititivy_fold = matrix(0, K, n_models)
+specificity_fold = matrix(0, K, n_models)
+
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = factor(ifelse(probabilities > 0.5, 1, 0), levels = 0:1)
+    true.classes = factor(pseudotest$aware, levels = 0:1)
+    
+    results = confusionMatrix(predicted.classes, true.classes, positive = "1")
+    test_error_fold[j, i] = 1 - results$overall["Accuracy"]
+    sensititivy_fold[j, i] = results$byClass["Sensitivity"]
+    specificity_fold[j, i] = results$byClass["Specificity"]
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = round(colMeans(test_error_fold), 4)
+sensitivity_cvs = round(colMeans(sensititivy_fold), 4)
+specificity_cvs = round(colMeans(specificity_fold), 4)  
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 2. Folds = 10 | Cutoff = 0.6
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = 10
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+test_error_fold = matrix(0, K, n_models)
+sensititivy_fold = matrix(0, K, n_models)
+specificity_fold = matrix(0, K, n_models)
+
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = factor(ifelse(probabilities > 0.6, 1, 0), levels = 0:1)
+    true.classes = factor(pseudotest$aware, levels = 0:1)
+    
+    results = confusionMatrix(predicted.classes, true.classes, positive = "1")
+    test_error_fold[j, i] = 1 - results$overall["Accuracy"]
+    sensititivy_fold[j, i] = results$byClass["Sensitivity"]
+    specificity_fold[j, i] = results$byClass["Specificity"]
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = round(colMeans(test_error_fold), 4)
+sensitivity_cvs = round(colMeans(sensititivy_fold), 4)
+specificity_cvs = round(colMeans(specificity_fold), 4)  
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 3. Folds = 10 | Cutoff = 0.7
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = 10
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+test_error_fold = matrix(0, K, n_models)
+sensititivy_fold = matrix(0, K, n_models)
+specificity_fold = matrix(0, K, n_models)
+
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = factor(ifelse(probabilities > 0.7, 1, 0), levels = 0:1)
+    true.classes = factor(pseudotest$aware, levels = 0:1)
+    
+    results = confusionMatrix(predicted.classes, true.classes, positive = "1")
+    test_error_fold[j, i] = 1 - results$overall["Accuracy"]
+    sensititivy_fold[j, i] = results$byClass["Sensitivity"]
+    specificity_fold[j, i] = results$byClass["Specificity"]
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = round(colMeans(test_error_fold), 4)
+sensitivity_cvs = round(colMeans(sensititivy_fold), 4)
+specificity_cvs = round(colMeans(specificity_fold), 4)  
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 4. Folds = 10 | Cutoff = 0.8
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = 10
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+test_error_fold = matrix(0, K, n_models)
+sensititivy_fold = matrix(0, K, n_models)
+specificity_fold = matrix(0, K, n_models)
+
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = factor(ifelse(probabilities > 0.8, 1, 0), levels = 0:1)
+    true.classes = factor(pseudotest$aware, levels = 0:1)
+    
+    results = confusionMatrix(predicted.classes, true.classes, positive = "1")
+    test_error_fold[j, i] = 1 - results$overall["Accuracy"]
+    sensititivy_fold[j, i] = results$byClass["Sensitivity"]
+    specificity_fold[j, i] = results$byClass["Specificity"]
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = round(colMeans(test_error_fold), 4)
+sensitivity_cvs = round(colMeans(sensititivy_fold), 4)
+specificity_cvs = round(colMeans(specificity_fold), 4)  
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 5. Folds = 10 | Cutoff = 0.9
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = 10
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+test_error_fold = matrix(0, K, n_models)
+sensititivy_fold = matrix(0, K, n_models)
+specificity_fold = matrix(0, K, n_models)
+
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = factor(ifelse(probabilities > 0.9, 1, 0), levels = 0:1)
+    true.classes = factor(pseudotest$aware, levels = 0:1)
+    
+    results = confusionMatrix(predicted.classes, true.classes, positive = "1")
+    test_error_fold[j, i] = 1 - results$overall["Accuracy"]
+    sensititivy_fold[j, i] = results$byClass["Sensitivity"]
+    specificity_fold[j, i] = results$byClass["Specificity"]
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = round(colMeans(test_error_fold), 4)
+sensitivity_cvs = round(colMeans(sensititivy_fold), 4)
+specificity_cvs = round(colMeans(specificity_fold), 4)  
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 1. LOO-CV | Cutoff = 0.5
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = nrow(data_complete)
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+predictions = matrix(0, K, n_models)
+true_values = matrix(0, K, n_models)
+
+# aa
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = ifelse(probabilities > 0.5, 1, 0)
+    true.classes = pseudotest$aware
+    
+    predictions[j, i] = predicted.classes
+    true_values[j, i] = true.classes
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = unname(round(c(
+  1 - confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$overall["Accuracy"]
+  ), 4))
+
+sensitivity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Sensitivity"]
+  ), 4))
+
+specificity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Specificity"]
+  ), 4))
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 2. LOO-CV | Cutoff = 0.6
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = nrow(data_complete)
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+predictions = matrix(0, K, n_models)
+true_values = matrix(0, K, n_models)
+
+# aa
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = ifelse(probabilities > 0.6, 1, 0)
+    true.classes = pseudotest$aware
+    
+    predictions[j, i] = predicted.classes
+    true_values[j, i] = true.classes
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = unname(round(c(
+  1 - confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$overall["Accuracy"]
+  ), 4))
+
+sensitivity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Sensitivity"]
+  ), 4))
+
+specificity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Specificity"]
+  ), 4))
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 3. LOO-CV | Cutoff = 0.7
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = nrow(data_complete)
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+predictions = matrix(0, K, n_models)
+true_values = matrix(0, K, n_models)
+
+# aa
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = ifelse(probabilities > 0.7, 1, 0)
+    true.classes = pseudotest$aware
+    
+    predictions[j, i] = predicted.classes
+    true_values[j, i] = true.classes
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = unname(round(c(
+  1 - confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$overall["Accuracy"]
+  ), 4))
+
+sensitivity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Sensitivity"]
+  ), 4))
+
+specificity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Specificity"]
+  ), 4))
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 4. LOO-CV | Cutoff = 0.8
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = nrow(data_complete)
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+predictions = matrix(0, K, n_models)
+true_values = matrix(0, K, n_models)
+
+# aa
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = ifelse(probabilities > 0.8, 1, 0)
+    true.classes = pseudotest$aware
+    
+    predictions[j, i] = predicted.classes
+    true_values[j, i] = true.classes
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = unname(round(c(
+  1 - confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$overall["Accuracy"]
+  ), 4))
+
+sensitivity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Sensitivity"]
+  ), 4))
+
+specificity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Specificity"]
+  ), 4))
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
+
+### 5. LOO-CV | Cutoff = 0.9
+```{r}
+# Implement K fold CV to estimate test performance
+
+K = nrow(data_complete)
+n = nrow(data_complete)
+n_models = 4
+
+permutation = sample(1:n)  
+predictions = matrix(0, K, n_models)
+true_values = matrix(0, K, n_models)
+
+# aa
+for (j in 1:K) {
+  # 1. extract indices of units in the pseudo-test set for split j
+  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  # 2. extract indices of units in the pseudo-training set for split j
+  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  # 3. fit all models of interest
+  mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
+  mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
+  mod3 = glm(aware ~ education + married + race + number_ppl_household + age_menarche + period_past_yr + parity + past_yr_12drinks, data = pseudotrain, family = binomial())
+  mod4 = mgcv::gam(aware ~ education + married + race + s(number_ppl_household, k = 3) + s(age_menarche, k = 3) + period_past_yr + s(parity, k = 3) + past_yr_12drinks, data = pseudotrain, family = binomial)
+  # 4. Compute Performance on each model
+  for (i in 1:n_models) {
+    probabilities = eval(parse(text = paste0("mod", i))) %>% predict(pseudotest, type = "response")
+    predicted.classes = ifelse(probabilities > 0.9, 1, 0)
+    true.classes = pseudotest$aware
+    
+    predictions[j, i] = predicted.classes
+    true_values[j, i] = true.classes
+  }
+}
+
+# average across splits to obtain CV estimate of test MSE
+test_error_cvs = unname(round(c(
+  1 - confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$overall["Accuracy"],
+  1 - confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$overall["Accuracy"]
+  ), 4))
+
+sensitivity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Sensitivity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Sensitivity"]
+  ), 4))
+
+specificity_cvs = unname(round(c(
+  confusionMatrix(as.factor(predictions[, 1]), as.factor(true_values[, 1] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 2]), as.factor(true_values[, 2] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 3]), as.factor(true_values[, 3] - 1), positive = "1")$byClass["Specificity"],
+  confusionMatrix(as.factor(predictions[, 4]), as.factor(true_values[, 4] - 1), positive = "1")$byClass["Specificity"]
+  ), 4))
+
+models = c("Model 1", "Model 2", "Model 3", "Model 4")
+descriptions = c("Logistic - All", "Logistic - Some", "Logistic - LASSO-selected", "GAM - LASSO-selected")
+
+results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+results %>% pander()
+```
