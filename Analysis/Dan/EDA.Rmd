@@ -190,6 +190,8 @@ summary(mod4)
 ```{r}
 # Implement K fold CV to estimate test performance
 
+set.seed(14)
+
 K = 10
 n = nrow(data_complete)
 n_models = 4
@@ -440,19 +442,20 @@ results %>% pander()
 ```{r, warning=F, message=F}
 # Implement K fold CV to estimate test performance
 
+set.seed(14)
+
 K = nrow(data_complete)
 n = nrow(data_complete)
 n_models = 4
 
-permutation = sample(1:n)  
 probabilities = matrix(0, K, n_models)
 true_values = matrix(0, K, n_models)
 
-for (j in 1:K) {
+for (j in 1:n) {
   # 1. extract indices of units in the pseudo-test set for split j
-  pseudotest = data_complete[permutation[floor((j-1)*n/K+1) : floor(j*n/K)], ]  
+  pseudotest = data_complete[j, ]  
   # 2. extract indices of units in the pseudo-training set for split j
-  pseudotrain = data_complete[setdiff(1:n, pseudotest), ]
+  pseudotrain = data_complete[-j, ]
   # 3. fit all models of interest
   mod1 = glm(aware ~ .-SEQN, data = pseudotrain, family = binomial)
   mod2 = glm(aware ~ smoker + education + married + age + race + income_poverty_ratio, data = pseudotrain, family = binomial())
@@ -467,7 +470,10 @@ for (j in 1:K) {
     true_values[j, i] = true.classes
   }
 }
+```
 
+## Functions for Tables/Plots
+```{r}
 # Create table using true_values and probabilities matrices
 create_table_for_cutoff = function(probabilities, true_values, cutoff){
   # Calculate Test Performance for cutoff value
@@ -518,7 +524,10 @@ create_roc_curve_plot = function(probabilities, true_values){
     xlab("Specificity") +
     ylab("Sensitivity")
 }
+```
 
+## Example Use of Functions
+```{r}
 # Example use
 create_table_for_cutoff(probabilities, true_values, 0.5)
 create_roc_curve_plot(probabilities, true_values)
