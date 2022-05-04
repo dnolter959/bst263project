@@ -437,7 +437,7 @@ results %>% pander()
 ```
 
 ### 1. LOO-CV
-```{r, warning=F, message=F}
+```{r}
 # Implement K fold CV to estimate test performance
 
 K = nrow(data_complete)
