@@ -1,0 +1,122 @@
+---
+title: "BST 263 Final YNL"
+output: html_document
+date: '2022-05-06'
+---
+
+---
+title: "Final Result Table and Chart"
+output: html_document
+date: '2022-05-06'
+---
+
+
+```{r}
+model_result <- read.csv("/Users/yuningliu/Desktop/BST 263 Final/model_output.csv")
+model_result
+
+#probability result from 6 models
+colnames(model_result) = c("Prob_RandForest", "Prob_kNN", "Prob_Boosting", "Prob_Logistic_all", "Prob_Logistic_LASSO_selected", "Prob_GAM_LASSO_selected", "True_Test_Values")
+predictions <- model_result[1:6]
+predictions
+#ture value
+tv <- model_result[7]
+true_values <- cbind(tv,tv,tv,tv,tv,tv)
+
+#true_value <- as.double(true_value)
+#true_value
+```
+
+```{r}
+library(pROC)
+
+for(i in 1:6) {
+  true_values[,i] = factor(true_values[,i], levels = c(0, 1), labels = c("0", "1"))
+}
+
+
+
+roc_rf = roc(true_values[,1], predictions[,1]) # ROC curve creation
+roc_kNN = roc(true_values[,2], predictions[,2]) 
+roc_boost = roc(true_values[,3], predictions[,3])
+roc_Logistic_All = roc(true_values[,4], predictions[,4])
+roc_Logistic_Lasso = roc(true_values[,5], predictions[,5])
+roc_GAM_Lasso = roc(true_values[,6], predictions[,6])
+
+
+ggroc(list("Random Forest" = roc_rf, "kNN" = roc_kNN, "Boosting" = roc_boost, "Logistic All" = roc_Logistic_All, "Logistic Lasso" = roc_Logistic_Lasso, "GAM_Lasso" = roc_GAM_Lasso)) +
+  theme(legend.title = element_blank()) +
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color = "black", linetype = "dashed") +
+  xlab("Sensitivity") +
+  ylab("Specificity") +
+  ggtitle("Six models ROC curve")
+  
+
+```
+
+
+# Evaluation tables for different cut off with LOO-CV
+```{r}
+set.seed(14)
+
+
+empty_list <- vector(mode = "list", length = 4)
+cut_offs = c(0.5, 0.6, 0.7, 0.8, 0.9)
+predictions_temp = predictions
+true_values_temp = true_values
+for(w in cut_offs) {
+  predictions = predictions_temp
+  true_values = true_values_temp
+  
+  for(u in 1:6) {
+    predictions[,u] = ifelse(predictions[,u] > w, 1, 0)
+    predictions[,u] = factor(predictions[,u], levels = c(0, 1), labels = c("0", "1"))
+    true_values[,u] = factor(true_values[,u], levels = c(0, 1), labels = c("0", "1"))
+  }
+
+  # average across splits to obtain CV estimate of test MSE
+  test_error_cvs = unname(round(c(
+    1 - confusionMatrix(predictions[, 1], true_values[, 1], positive = "1")$overall["Accuracy"],
+    1 - confusionMatrix(predictions[, 2], true_values[, 2], positive = "1")$overall["Accuracy"],
+    1 - confusionMatrix(predictions[, 3], true_values[, 3], positive = "1")$overall["Accuracy"], 
+    1 - confusionMatrix(predictions[, 4], true_values[, 4], positive = "1")$overall["Accuracy"],
+    1 - confusionMatrix(predictions[, 5], true_values[, 5], positive = "1")$overall["Accuracy"],
+    1 - confusionMatrix(predictions[, 6], true_values[, 6], positive = "1")$overall["Accuracy"]),7))
+
+  sensitivity_cvs = unname(round(c(
+    confusionMatrix(predictions[, 1], true_values[, 1], positive = "1")$byClass["Sensitivity"],
+    confusionMatrix(predictions[, 2], true_values[, 2], positive = "1")$byClass["Sensitivity"],
+    confusionMatrix(predictions[, 3], true_values[, 3], positive = "1")$byClass["Sensitivity"], 
+    confusionMatrix(predictions[, 4], true_values[, 4], positive = "1")$byClass["Sensitivity"],
+    confusionMatrix(predictions[, 5], true_values[, 5], positive = "1")$byClass["Sensitivity"],
+    confusionMatrix(predictions[, 6], true_values[, 6], positive = "1")$byClass["Sensitivity"]),7))
+
+  specificity_cvs = unname(round(c(
+    confusionMatrix(predictions[, 1], true_values[, 1], positive = "1")$byClass["Specificity"],
+    confusionMatrix(predictions[, 2], true_values[, 2], positive = "1")$byClass["Specificity"],
+    confusionMatrix(predictions[, 3], true_values[, 3], positive = "1")$byClass["Specificity"],
+    confusionMatrix(predictions[, 4], true_values[, 4], positive = "1")$byClass["Specificity"],
+    confusionMatrix(predictions[, 5], true_values[, 5], positive = "1")$byClass["Specificity"],
+    confusionMatrix(predictions[, 6], true_values[, 6], positive = "1")$byClass["Specificity"]),7))
+
+  models = c("Model 1", "Model 2", "Model 3", "Model 4", "Model 5", "Model 6")
+  descriptions = c("Random Forest", "kNN", "Boosting", "Logistic All", "Logistic Lasso", "GAM_Lasso" )
+
+  results = cbind(models, descriptions, test_error_cvs, sensitivity_cvs, specificity_cvs)
+  colnames(results) = c("Model", "Description", "Test Error Rate", "Sensitivity", "Specificity")
+
+  empty_list[[which(cut_offs == w)]] = results 
+  
+  # Print table
+  results %>% pander()
+  
+}
+
+
+
+```
+
+
+
+
+
